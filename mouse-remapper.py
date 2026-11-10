@@ -120,6 +120,42 @@ for i in range(1, 25):
 SPECIAL_KEYS = {k: v for k, v in SPECIAL_KEYS.items() if v is not None}
 
 
+KEY_TO_LABEL = {}
+
+
+def _map_key(attr_name, label):
+    k = getattr(keyboard.Key, attr_name, None)
+    if k is not None:
+        KEY_TO_LABEL[k] = label
+
+
+for attr, label in [
+    ("alt", "alt"), ("alt_l", "alt"), ("alt_r", "alt"), ("alt_gr", "altgr"),
+    ("ctrl", "ctrl"), ("ctrl_l", "ctrl"), ("ctrl_r", "ctrl"),
+    ("shift", "shift"), ("shift_l", "shift"), ("shift_r", "shift"),
+    ("cmd", "cmd"), ("cmd_l", "cmd"), ("cmd_r", "cmd"),
+    ("tab", "tab"), ("esc", "esc"), ("enter", "enter"), ("space", "space"),
+    ("backspace", "backspace"), ("delete", "delete"),
+    ("up", "up"), ("down", "down"), ("left", "left"), ("right", "right"),
+    ("home", "home"), ("end", "end"), ("page_up", "pageup"), ("page_down", "pagedown"),
+    ("caps_lock", "capslock"), ("print_screen", "printscreen"),
+    ("insert", "insert"), ("menu", "menu"),
+]:
+    _map_key(attr, label)
+for i in range(1, 25):
+    _map_key(f"f{i}", f"f{i}")
+
+
+def key_event_to_label(key):
+    """Convert a pynput key event (from a listener) into a label string
+    compatible with parse_combo(), e.g. Key.alt -> 'alt', KeyCode('c') -> 'c'."""
+    if isinstance(key, keyboard.KeyCode):
+        if key.char:
+            return key.char.lower()
+        return None  # unidentifiable key (e.g. some media keys) - skip it
+    return KEY_TO_LABEL.get(key)
+
+
 def parse_combo(text):
     """Turn 'ctrl+shift+esc' into a list of pynput key objects/characters."""
     parts = [p.strip().lower() for p in text.split("+") if p.strip()]
@@ -156,9 +192,11 @@ class RemapEngine:
         if self.active:
             return
         self.mouse_listener = mouse.Listener(
-            on_click=self._on_click, on_scroll=self._on_scroll, suppress=True
+            on_click=self._on_click, on_scroll=self._on_scroll, on_move=self._on_move,
+            suppress=True
         )
         self.mouse_listener.start()
+        print("[engine] mouse listener started")
 
         if self.panic_listener is None:
             self.panic_listener = keyboard.Listener(on_press=self._on_panic_key)
@@ -202,11 +240,15 @@ class RemapEngine:
     def _on_click(self, x, y, button, pressed):
         if self._injecting:
             return
+        print(f"[click] button={button!r} pressed={pressed}")
         name = PYNPUT_BUTTON_TO_NAME.get(button)
         if name is None:
+            print(f"[click] no internal name for {button!r} (unsupported on this platform)")
             return
         mappings = self.get_mappings()
+        print(f"[click] mapped name='{name}', current mappings={mappings}")
         if name in mappings and pressed:
+            print(f"[click] firing combo '{mappings[name]}'")
             self._fire_combo(mappings[name])
         elif name not in mappings:
             # Pass the original click through untouched
@@ -218,6 +260,18 @@ class RemapEngine:
                     self.mouse_controller.release(button)
             finally:
                 self._injecting = False
+
+    def _on_move(self, x, y):
+        # suppress=True blocks ALL raw mouse events, including plain cursor
+        # movement, not just clicks/scroll — so we have to manually put the
+        # cursor back where the OS says it actually is, or it never moves.
+        if self._injecting:
+            return
+        self._injecting = True
+        try:
+            self.mouse_controller.position = (x, y)
+        finally:
+            self._injecting = False
 
     def _on_scroll(self, x, y, dx, dy):
         if self._injecting:
@@ -248,6 +302,13 @@ class App(ctk.CTk):
         self.mappings = {}  # name -> combo text, e.g. {"x1": "alt+tab"}
         self.engine = RemapEngine(lambda: self.mappings, self._on_engine_status)
 
+        # key-combo recording state
+        self.recording = False
+        self.record_listener = None
+        self._held_keys = []       # ordered list of labels currently held down
+        self._held_set = set()
+        self._captured_any = False
+
         self._load_config()
         self._build_ui()
         self._refresh_mapping_list()
@@ -268,16 +329,20 @@ class App(ctk.CTk):
         self.button_dropdown = ctk.CTkOptionMenu(form, values=BUTTON_OPTIONS)
         self.button_dropdown.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
 
-        ctk.CTkLabel(form, text="Key or combo (e.g. alt+tab, ctrl+c, f5):").grid(
-            row=2, column=0, sticky="w", padx=10, pady=(0, 4)
+        ctk.CTkLabel(form, text="Key or combo — type it, or hit Record and press the keys:").grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 4)
         )
         self.key_entry = ctk.CTkEntry(form, placeholder_text="alt+tab")
-        self.key_entry.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
+        self.key_entry.grid(row=3, column=0, sticky="ew", padx=(10, 5), pady=(0, 10))
+
+        self.record_btn = ctk.CTkButton(form, text="● Record", width=90, fg_color="gray30",
+                                         hover_color="#8a2f2f", command=self._toggle_record)
+        self.record_btn.grid(row=3, column=1, sticky="ew", padx=(5, 10), pady=(0, 10))
 
         form.grid_columnconfigure(0, weight=1)
 
         btn_row = ctk.CTkFrame(form, fg_color="transparent")
-        btn_row.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 10))
+        btn_row.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
         btn_row.grid_columnconfigure((0, 1), weight=1)
 
         assign_btn = ctk.CTkButton(btn_row, text="Assign", command=self._assign_mapping)
@@ -305,6 +370,63 @@ class App(ctk.CTk):
 
         self.status_label = ctk.CTkLabel(self, text="Status: stopped  |  Panic key: F9", text_color="gray")
         self.status_label.pack(pady=(0, 12))
+
+    # -- key combo recording -------------------------------------------
+    def _toggle_record(self):
+        if self.recording:
+            self._stop_record()
+        else:
+            self._start_record()
+
+    def _start_record(self):
+        if self.engine.active:
+            messagebox.showinfo("Stop remapping first", "Stop remapping before recording a new combo.")
+            return
+        self.recording = True
+        self._held_keys = []
+        self._held_set = set()
+        self._captured_any = False
+        self.key_entry.delete(0, "end")
+        self.key_entry.configure(placeholder_text="Press keys now...")
+        self.record_btn.configure(text="■ Stop", fg_color="#a83b2f", hover_color="#80302a")
+        self.record_listener = keyboard.Listener(
+            on_press=self._on_record_press, on_release=self._on_record_release
+        )
+        self.record_listener.start()
+
+    def _stop_record(self):
+        self.recording = False
+        if self.record_listener:
+            self.record_listener.stop()
+            self.record_listener = None
+        self.record_btn.configure(text="● Record", fg_color="gray30", hover_color="#8a2f2f")
+
+    def _on_record_press(self, key):
+        # Esc with nothing else held yet cancels recording instead of being captured
+        if key == keyboard.Key.esc and not self._held_set:
+            self.after(0, self._stop_record)
+            return
+        label = key_event_to_label(key)
+        if label is None:
+            return
+        if label not in self._held_set:
+            self._held_set.add(label)
+            self._held_keys.append(label)
+            self._captured_any = True
+        combo_text = "+".join(self._held_keys)
+        self.after(0, self._update_record_entry, combo_text)
+
+    def _on_record_release(self, key):
+        label = key_event_to_label(key)
+        if label and label in self._held_set:
+            self._held_set.discard(label)
+        # once every held key has been released, the combo is finalized
+        if self._captured_any and not self._held_set:
+            self.after(0, self._stop_record)
+
+    def _update_record_entry(self, combo_text):
+        self.key_entry.delete(0, "end")
+        self.key_entry.insert(0, combo_text)
 
     # -- actions -----------------------------------------------------
     def _assign_mapping(self):
@@ -399,6 +521,8 @@ class App(ctk.CTk):
                 self.mappings = {}
 
     def _on_close(self):
+        if self.record_listener:
+            self.record_listener.stop()
         self.engine.shutdown()
         self.destroy()
 
